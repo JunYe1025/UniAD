@@ -4,6 +4,12 @@
 # Copyright (c) OpenDriveLab. All rights reserved.                                #
 #---------------------------------------------------------------------------------#
 
+"""
+1.输入的量的物理含义及其维度还是不太理解（即agent_level_anchors、scene_level_ego_anchors、scene_level_offset_anchors、learnable_query_pos）
+2.loss计算的细节还是没有太搞明白
+"""
+
+
 import torch
 import copy
 from mmdet.models import HEADS
@@ -27,7 +33,7 @@ class MotionHead(BaseMotionHead):
         *args: Variable length argument list.
         predict_steps (int): The number of steps to predict motion trajectories.
         transformerlayers (dict): A dictionary defining the configuration of transformer layers.
-        bbox_coder: An instance of a bbox coder to be used for encoding/decoding boxes.
+        bbox_coder: An instance of a bbox coder to be used for encoding/decoding boxes. 【包含编码(encode)和解码(decode)两个过程:1)将原始边界框参数转换为网络训练所需的格式;2)将网络输出转换回实际的边界框参数】
         num_cls_fcs (int): The number of fully-connected layers in the classification branch.
         bev_h (int): The height of the bird's-eye-view map.
         bev_w (int): The width of the bird's-eye-view map.
@@ -66,8 +72,8 @@ class MotionHead(BaseMotionHead):
         self.num_cls_fcs = num_cls_fcs - 1
         self.num_reg_fcs = num_cls_fcs - 1
         self.embed_dims = embed_dims        
-        self.num_anchor = num_anchor
-        self.num_anchor_group = len(group_id_list)
+        self.num_anchor = num_anchor # num_anchor：每个组内预测的轨迹数量（多模态预测）
+        self.num_anchor_group = len(group_id_list) # 不同类型目标的分组（如车辆、行人等）的数量
         
         # we merge the classes into groups for anchor assignment
         self.cls2group = [0 for i in range(num_classes)]
@@ -91,10 +97,10 @@ class MotionHead(BaseMotionHead):
                       gt_labels_3d,
                       gt_fut_traj=None,
                       gt_fut_traj_mask=None,
-                      gt_sdc_fut_traj=None, 
-                      gt_sdc_fut_traj_mask=None, 
-                      outs_track={},
-                      outs_seg={}
+                      gt_sdc_fut_traj=None, # 自车未来轨迹真值
+                      gt_sdc_fut_traj_mask=None, # 自车未来轨迹掩码
+                      outs_track={}, # 跟踪头输出
+                      outs_seg={} # 分割头输出
                   ):
         """Forward function
         Args:
@@ -103,8 +109,12 @@ class MotionHead(BaseMotionHead):
                 bboxes of each sample.
             gt_labels_3d (list[torch.Tensor]): Labels of each sample.
             img_metas (list[dict]): Meta information of each sample.
-            gt_fut_traj (list[torch.Tensor]): Ground truth future trajectory of each sample.
-            gt_fut_traj_mask (list[torch.Tensor]): Ground truth future trajectory mask of each sample.
+            gt_fut_traj (list[torch.Tensor]): Ground truth future trajectory of each sample. gt_fut_traj维度可以认为是[B, N, T, 2]，N代表智能体数量
+            假设：gt_fut_traj[0]  # 第一个batch
+                    ├── target_0_traj  # [T, 2] 第一个目标的轨迹
+                    ├── target_1_traj  # [T, 2] 第二个目标的轨迹
+                    └── target_2_traj  # [T, 2] 第三个目标的轨迹
+            gt_fut_traj_mask (list[torch.Tensor]): Ground truth future trajectory mask of each sample. 【mask: 指示每个轨迹点是否有效（比如被遮挡或超出视野）】
             gt_sdc_fut_traj (list[torch.Tensor]): Ground truth future trajectory of each sample.
             gt_sdc_fut_traj_mask (list[torch.Tensor]): Ground truth future trajectory mask of each sample.
             outs_track (dict): Outputs of track head.
@@ -113,16 +123,21 @@ class MotionHead(BaseMotionHead):
         Returns:
             dict: Losses of each branch.
         """
-        track_query = outs_track['track_query_embeddings'][None, None, ...] # num_dec, B, A_track, D
+
+        # outs_track是一个字典类型
+        # track_query: [num_dec, B, A_track, D]，其中num_dec: 解码器层数，B: batch size，A_track: 跟踪目标数量，D: 特征维度
+        track_query = outs_track['track_query_embeddings'][None, None, ...] # 这里的 None 在索引中用于增加维度
         all_matched_idxes = [outs_track['track_query_matched_idxes']] #BxN
         track_boxes = outs_track['track_bbox_results']
-        
+
         # cat sdc query/gt to the last
         sdc_match_index = torch.zeros((1,), dtype=all_matched_idxes[0].dtype, device=all_matched_idxes[0].device)
-        sdc_match_index[0] = gt_fut_traj[0].shape[0]
+        sdc_match_index[0] = gt_fut_traj[0].shape[0] # shape[0]读取矩阵第一维度的长度。如果是三行两列的张亮，那么shape[0]就是3，shape[1]就是2
         all_matched_idxes = [torch.cat([all_matched_idxes[0], sdc_match_index], dim=0)]
         gt_fut_traj[0] = torch.cat([gt_fut_traj[0], gt_sdc_fut_traj[0]], dim=0)
         gt_fut_traj_mask[0] = torch.cat([gt_fut_traj_mask[0], gt_sdc_fut_traj_mask[0]], dim=0)
+
+        # 将自车轨迹信息添加到track_query中，也就是把自车相关的嵌入表示（embedding）合并到总的跟踪查询数据中，这样后续处理就能同时考虑普通跟踪目标和自车的相关特征等信息了。
         track_query = torch.cat([track_query, outs_track['sdc_embedding'][None, None, None, :]], dim=2)
         sdc_track_boxes = outs_track['sdc_track_bbox_results']
         track_boxes[0][0].tensor = torch.cat([track_boxes[0][0].tensor, sdc_track_boxes[0][0].tensor], dim=0)
@@ -132,7 +147,11 @@ class MotionHead(BaseMotionHead):
         
         memory, memory_mask, memory_pos, lane_query, _, lane_query_pos, hw_lvl = outs_seg['args_tuple']
 
-        outs_motion = self(bev_embed, track_query, lane_query, lane_query_pos, track_boxes)
+        # self()表示调用当前类（也就是 MotionHead 类）中定义的 __call__ （forward）方法
+        # track_query[:, -1]是给到Agent-Agent Interaction时，Track方面的输入（track_query[:, -1]其实是作为了Key）
+        # lane_query是给到Agent-Map Interaction时，Map方面的输入（lane_query其实是作为了Key）
+        # 之所以lane_query部分是直接从outs_seg['args_tuple']取，而track_query在本py文件中还做了处理，是因为track_query在本py文件中还加了sdc的内容
+        outs_motion = self(bev_embed, track_query, lane_query, lane_query_pos, track_boxes) 
         loss_inputs = [gt_bboxes_3d, gt_fut_traj, gt_fut_traj_mask, outs_motion, all_matched_idxes, track_boxes]
         losses = self.loss(*loss_inputs)
 
@@ -141,6 +160,8 @@ class MotionHead(BaseMotionHead):
             # select vehicle query according to vehicle_id_list
             vehicle_mask = torch.zeros_like(query_label)
             for veh_id in vehicle_id_list:
+                # vehicle_mask = vehicle_mask | (query_label == veh_id)
+                # 当对张量（或其他支持比较运算的数据结构）使用比较运算符（如 >、<、== 等）时，会对张量中的每个元素逐个进行比较运算
                 vehicle_mask |=  query_label == veh_id
             outs_motion['traj_query'] = outs_motion['traj_query'][:, :, vehicle_mask>0]
             outs_motion['track_query'] = outs_motion['track_query'][:, vehicle_mask>0]
@@ -150,7 +171,9 @@ class MotionHead(BaseMotionHead):
 
         all_matched_idxes[0] = all_matched_idxes[0][:-1]
         outs_motion['sdc_traj_query'] = outs_motion['traj_query'][:, :, -1]         # [3, 1, 6, 256]     [n_dec, b, n_mode, d]
+        # sdc_track_query是特征向量；然后track可能指的是目标的当前状态所对应的特征向量
         outs_motion['sdc_track_query'] = outs_motion['track_query'][:, -1]          # [1, 256]           [b, d]
+        # xxx_pos是将位置（也就是x,y）转成和特征向量维度一致的位置嵌入，然后这个xxx_pos可以为特征添加空间位置信息以及帮助模型理解目标的空间关系
         outs_motion['sdc_track_query_pos'] = outs_motion['track_query_pos'][:, -1]  # [1, 256]           [b, d]
         outs_motion['traj_query'] = outs_motion['traj_query'][:, :, :-1]            # [3, 1, 3, 6, 256]  [n_dec, b, nq, n_mode, d]
         outs_motion['track_query'] = outs_motion['track_query'][:, :-1]             # [1, 3, 256]        [b, nq, d]   
@@ -239,45 +262,50 @@ class MotionHead(BaseMotionHead):
         device = track_query.device
         num_groups = self.kmeans_anchors.shape[0]
 
-        # extract the last frame of the track query
+        # extract the last frame of the track query。最后一帧指的是detect query了还是detect query前面的一帧，也就是说track_query[:, -1]仍然是过去的时刻，还是当前的时刻？？？
         track_query = track_query[:, -1]
         
-        # encode the center point of the track query
+        # encode the center point of the track query 提取跟踪中心点并编码
         reference_points_track = self._extract_tracking_centers(
             track_bbox_results, self.pc_range)
         track_query_pos = self.boxes_query_embedding_layer(pos2posemb2d(reference_points_track.to(device)))  # B, A, D
         
         # construct the learnable query positional embedding
         # split and stack according to groups
+        # 这个learnable是什么意思，用在哪里，和什么有关？？？
         learnable_query_pos = self.learnable_motion_query_embedding.weight.to(dtype)  # latent anchor (P*G, D)
-        learnable_query_pos = torch.stack(torch.split(learnable_query_pos, self.num_anchor, dim=0))
+        learnable_query_pos = torch.stack(torch.split(learnable_query_pos, self.num_anchor, dim=0)) # 维度重组为[num_groups, num_anchor, embed_dims]
 
         # construct the agent level/scene-level query positional embedding 
         # (num_groups, num_anchor, 12, 2)
         # to incorporate the information of different groups and coordinates, and embed the headding and location information
-        agent_level_anchors = self.kmeans_anchors.to(dtype).to(device).view(num_groups, self.num_anchor, self.predict_steps, 2).detach()
-        scene_level_ego_anchors = anchor_coordinate_transform(agent_level_anchors, track_bbox_results, with_translation_transform=True)  # B, A, G, P ,12 ,2
+        agent_level_anchors = self.kmeans_anchors.to(dtype).to(device).view(num_groups, self.num_anchor, self.predict_steps, 2).detach() # 论文中I^a_T，不过I^a_T具体啥意思，还是没太理解？？？
+        scene_level_ego_anchors = anchor_coordinate_transform(agent_level_anchors, track_bbox_results, with_translation_transform=True)  # B, A, G, P ,12 ,2   # 论文中I^s_T吧，不过I^s_T具体啥意思，还是没太理解？？？
         scene_level_offset_anchors = anchor_coordinate_transform(agent_level_anchors, track_bbox_results, with_translation_transform=False)  # B, A, G, P ,12 ,2
+        # B (Batch) = batch_size = len(bbox_results)
+        # A (Agents) = num_agents = mode_query_pos.shape[1]
+        # G (Groups) = num_groups = self.kmeans_anchors.shape[0]
+        # P (Points) = num_anchor = self.num_anchor: 每个组的锚点/模式数量；每种类型的模式数
 
         agent_level_norm = norm_points(agent_level_anchors, self.pc_range)
         scene_level_ego_norm = norm_points(scene_level_ego_anchors, self.pc_range)
         scene_level_offset_norm = norm_points(scene_level_offset_anchors, self.pc_range)
 
         # we only use the last point of the anchor
+        # 2D轨迹点(2维)->位置嵌入（经过pos2posemb2d后成了256维）->embedding(经过了MLP)
         agent_level_embedding = self.agent_level_embedding_layer(
-            pos2posemb2d(agent_level_norm[..., -1, :]))  # G, P, D
+            pos2posemb2d(agent_level_norm[..., -1, :]))  # G, P, D # 论文中I^a_T经过PE和MLP
         scene_level_ego_embedding = self.scene_level_ego_embedding_layer(
-            pos2posemb2d(scene_level_ego_norm[..., -1, :]))  # B, A, G, P , D
+            pos2posemb2d(scene_level_ego_norm[..., -1, :]))  # B, A, G, P, D  # 论文中I^s_T经过PE和MLP
         scene_level_offset_embedding = self.scene_level_offset_embedding_layer(
-            pos2posemb2d(scene_level_offset_norm[..., -1, :]))  # B, A, G, P , D
+            pos2posemb2d(scene_level_offset_norm[..., -1, :]))  # B, A, G, P, D
 
         batch_size, num_agents = scene_level_ego_embedding.shape[:2]
-        agent_level_embedding = agent_level_embedding[None,None, ...].expand(batch_size, num_agents, -1, -1, -1)
+        agent_level_embedding = agent_level_embedding[None,None, ...].expand(batch_size, num_agents, -1, -1, -1) # expand()方法中的-1表示在该维度保持原始大小不变
         learnable_embed = learnable_query_pos[None, None, ...].expand(batch_size, num_agents, -1, -1, -1)
 
-        
         # save for latter, anchors
-        # B, A, G, P ,12 ,2 -> B, A, P ,12 ,2
+        # B, A, G, P ,12 ,2 -> B, A, P ,12 ,2    #G表示不同的目标组别(groups),根据每个目标的类别，从G个组中选择对应的特征,选择后就不需要保留其他组的信息，所以G维度被消除
         scene_level_offset_anchors = self.group_mode_query_pos(track_bbox_results, scene_level_offset_anchors)  
 
         # select class embedding
@@ -298,6 +326,7 @@ class MotionHead(BaseMotionHead):
         outputs_traj_scores = []
         outputs_trajs = []
 
+        # ***MotionTransformerDecoder是通过self.motionformer调用的***
         inter_states, inter_references = self.motionformer(
             track_query,  # B, A_track, D
             lane_query,  # B, M, D
@@ -321,8 +350,9 @@ class MotionHead(BaseMotionHead):
                 [[self.bev_h, self.bev_w]], device=device),
             level_start_index=torch.tensor([0], device=device))
 
+        # 轨迹生成和后处理
         for lvl in range(inter_states.shape[0]):
-            outputs_class = self.traj_cls_branches[lvl](inter_states[lvl])
+            outputs_class = self.traj_cls_branches[lvl](inter_states[lvl]) # traj_cls_branches预测每个轨迹模态的置信度分数
             tmp = self.traj_reg_branches[lvl](inter_states[lvl])
             tmp = self.unflatten_traj(tmp)
             
@@ -335,11 +365,11 @@ class MotionHead(BaseMotionHead):
             for bs in range(tmp.shape[0]):
                 tmp[bs] = bivariate_gaussian_activation(tmp[bs])
             outputs_trajs.append(tmp)
-        outputs_traj_scores = torch.stack(outputs_traj_scores)
+        outputs_traj_scores = torch.stack(outputs_traj_scores) # 这些分数表示模型对每个预测轨迹的置信程度
         outputs_trajs = torch.stack(outputs_trajs)
 
         B, A_track, D = track_query.shape
-        valid_traj_masks = track_query.new_ones((B, A_track)) > 0
+        valid_traj_masks = track_query.new_ones((B, A_track)) > 0 # valid_traj_masks是一个形状为 (B, A_track) 的布尔类型张量
         outs = {
             'all_traj_scores': outputs_traj_scores,
             'all_traj_preds': outputs_trajs,
@@ -353,6 +383,7 @@ class MotionHead(BaseMotionHead):
 
     def group_mode_query_pos(self, bbox_results, mode_query_pos):
         """
+        用于处理不同组别的多模态预测，group指不同类型的目标分组
         Group mode query positions based on the input bounding box results.
         
         Args:
@@ -369,10 +400,15 @@ class MotionHead(BaseMotionHead):
         # TODO: vectorize this
         # group the embeddings based on the class
         for i in range(batch_size):
+            # 1. 获取每个目标的类别
             bboxes, scores, labels, bbox_index, mask = bbox_results[i]
             label = labels.to(mode_query_pos.device)
+
+            # 2. 将类别映射到组别
             grouped_label = self.cls2group[label]
             grouped_mode_query_pos = []
+
+            # 3. 根据组别选择对应的查询位置
             for j in range(agent_num):
                 grouped_mode_query_pos.append(
                     mode_query_pos[i, j, grouped_label[j]])
@@ -388,6 +424,7 @@ class MotionHead(BaseMotionHead):
              all_matched_idxes,
              track_bbox_results):
         """
+        # 该def中是整合所有损失并加权
         Computes the loss function for the given ground truth and prediction dictionaries.
         
         Args:
@@ -494,6 +531,7 @@ class MotionHead(BaseMotionHead):
         gt_fut_traj_mask_all = torch.cat(gt_fut_traj_mask_all, dim=0)
         return gt_fut_traj_all, gt_fut_traj_mask_all
 
+    # compute_loss_traj: 计算单个轨迹的损失
     def compute_loss_traj(self,
                           traj_scores,
                           traj_preds,
@@ -558,3 +596,35 @@ class MotionHead(BaseMotionHead):
                 preds['traj_scores' + subfix] = traj_scores
             ret_list.append(preds)
         return ret_list
+
+
+"""
+整体工作流程
+1.数据预处理：
+  从跟踪头获取车辆特征和位置信息
+  合并自车和其他车辆的信息
+2.特征提取和融合：
+  从分割头获取地图特征
+  从BEV特征图获取场景信息
+3.轨迹预测：
+  调用MotionTransformerDecoder进行预测
+  生成多模态轨迹预测
+4.后处理：
+  分离自车和其他车辆的预测结果
+  过滤非车辆目标
+  整理输出格式
+"""
+
+"""
+与其他模块之间的的关系
+1.与BaseMotionHead的关系
+  继承基础功能（损失计算、网络层构建等）
+  实现具体的前向传播逻辑
+2.与MotionTransformerDecoder的关系
+  提供必要的输入（跟踪特征、地图特征等）
+  接收并处理预测结果
+3.与其他头的交互
+  使用跟踪头(TrackHead)的输出
+  使用分割头(SegHead)的输出
+  整合多个任务的特征
+"""

@@ -8,7 +8,7 @@ import torch
 import copy
 import pickle
 import torch.nn as nn
-from mmdet.models import  build_loss
+from mmdet.models import build_loss
 from mmcv.cnn.bricks.transformer import build_transformer_layer_sequence
 
 class BaseMotionHead(nn.Module):
@@ -111,6 +111,7 @@ class BaseMotionHead(nn.Module):
         def _get_clones(module, N):
             return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+        # 为每一层transformer创建一个独立的预测分支
         num_pred = self.motionformer.num_layers
         self.traj_cls_branches = _get_clones(traj_cls_branch, num_pred)
         self.traj_reg_branches = _get_clones(traj_reg_branch, num_pred)

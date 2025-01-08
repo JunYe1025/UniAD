@@ -12,6 +12,15 @@ def bivariate_gaussian_activation(ip):
     Returns:
         torch.Tensor: Output tensor containing the parameters of the bivariate Gaussian distribution.
     """
+
+    """
+    将轨迹预测转换为二元高斯分布参数
+    输入: [batch_size, num_modes, steps, 5]  # (x, y, σx, σy, ρ)
+    输出: 每个时间步的位置分布
+
+    作用：将确定性的轨迹点转换为概率分布，每个预测点用二维高斯分布表示，可以表达预测的不确定性，有助于计算概率性的损失函数
+    """
+
     mu_x = ip[..., 0:1]
     mu_y = ip[..., 1:2]
     sig_x = ip[..., 2:3]
@@ -38,7 +47,7 @@ def norm_points(pos, pc_range):
     y_norm = (pos[..., 1] - pc_range[1]) / (pc_range[4] - pc_range[1]) 
     return torch.stack([x_norm, y_norm], dim=-1)
 
-def pos2posemb2d(pos, num_pos_feats=128, temperature=10000):
+def pos2posemb2d(pos, num_pos_feats=128, temperature=10000): # pos2posemb2d的作用是将2D位置特征转换为256维的嵌入向量
     """
     Convert 2D position into positional embeddings.
 
@@ -52,13 +61,40 @@ def pos2posemb2d(pos, num_pos_feats=128, temperature=10000):
     """
     scale = 2 * math.pi
     pos = pos * scale
-    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device)
-    dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+    dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=pos.device) # [start, end)。也就是[0，1，...，127]
+    dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats) # //表示整数除法，也就是dim_t除以2得到的整数部分
+    # 让我们分解这个计算：
+    # 1. dim_t // 2: [0,0,1,1,2,2,...,63,63]
+    # 2. 2 * (dim_t // 2): [0,0,2,2,4,4,...,126,126]
+    # 3. ... / num_pos_feats: [0,0,2/128,2/128,4/128,4/128,...,126/128,126/128]
+    # 4. temperature ** (...): [1,1,10000^(2/128),10000^(2/128),...,10000^(126/128),10000^(126/128)] 
+    # 这个操作创建了一个几何级数序列，用于后续的位置编码。这种设计使得不同维度能够捕获不同尺度的位置信息。
+
+
     pos_x = pos[..., 0, None] / dim_t
     pos_y = pos[..., 1, None] / dim_t
-    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    # 假设输入pos的维度是 [bs, n_agent, n_modes, 2]
+    # 1. pos[..., 0]: 选择x坐标
+    # 维度变为: [bs, n_agent, n_modes]
+    # 2. pos[..., 0, None]: 增加一个维度
+    # 维度变为: [bs, n_agent, n_modes, 1]
+    # 3. dim_t的维度是 [128]
+    # 4. pos[..., 0, None] / dim_t: 广播除法
+    # 最终维度变为: [bs, n_agent, n_modes, 128]
+
+    # 0::2 --> start:stop（省略了）:step
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2) # 维度: [bs, n_agent, n_modes, 64, 2]
+    # 1. pos_x[..., 0::2]选择偶数索引
+    # 维度: [bs, n_agent, n_modes, 64]
+    # 2. pos_x[..., 1::2]选择奇数索引
+    # 维度: [bs, n_agent, n_modes, 64]
+    # 3. torch.stack(..., dim=-1)
+    # pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1) --> 维度: [bs, n_agent, n_modes, 64, 2]
+    # 4. flatten(-2)：将最后两个维度展平
+    # pos_x = pos_x.flatten(-2) --> 维度: [bs, n_agent, n_modes, 128]
+    
     pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
-    posemb = torch.cat((pos_y, pos_x), dim=-1)
+    posemb = torch.cat((pos_y, pos_x), dim=-1) # [bs, n_agent, n_modes, 256]
     return posemb
 
 def rot_2d(yaw):
