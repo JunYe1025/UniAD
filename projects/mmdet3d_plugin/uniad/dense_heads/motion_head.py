@@ -72,7 +72,7 @@ class MotionHead(BaseMotionHead):
         self.num_cls_fcs = num_cls_fcs - 1
         self.num_reg_fcs = num_cls_fcs - 1
         self.embed_dims = embed_dims        
-        self.num_anchor = num_anchor # num_anchor：每个组内预测的轨迹数量（多模态预测）
+        self.num_anchor = num_anchor # 这个好像是论文中的K，这是又好像是每个group里面agent的数量，因为这里是从groud truth（groud truth应该不会有每个agent多个modality吧）里面提取的，所以是agent的数量
         self.num_anchor_group = len(group_id_list) # 不同类型目标的分组（如车辆、行人等）的数量
         
         # we merge the classes into groups for anchor assignment
@@ -294,11 +294,11 @@ class MotionHead(BaseMotionHead):
         # we only use the last point of the anchor
         # 2D轨迹点(2维)->位置嵌入（经过pos2posemb2d后成了256维）->embedding(经过了MLP)
         agent_level_embedding = self.agent_level_embedding_layer(
-            pos2posemb2d(agent_level_norm[..., -1, :]))  # G, P, D # 论文中I^a_T经过PE和MLP
+            pos2posemb2d(agent_level_norm[..., -1, :]))  # G, P, D # 论文中I^a_T(这是一个点)经过PE和MLP
         scene_level_ego_embedding = self.scene_level_ego_embedding_layer(
-            pos2posemb2d(scene_level_ego_norm[..., -1, :]))  # B, A, G, P, D  # 论文中I^s_T经过PE和MLP
+            pos2posemb2d(scene_level_ego_norm[..., -1, :]))  # B, A, G, P, D  # /hat(x)_0
         scene_level_offset_embedding = self.scene_level_offset_embedding_layer(
-            pos2posemb2d(scene_level_offset_norm[..., -1, :]))  # B, A, G, P, D
+            pos2posemb2d(scene_level_offset_norm[..., -1, :]))  # B, A, G, P, D # I^s_T (这是一个点，然后offset的意思指的就是agent-level到scene-level的transition吧)
 
         batch_size, num_agents = scene_level_ego_embedding.shape[:2]
         agent_level_embedding = agent_level_embedding[None,None, ...].expand(batch_size, num_agents, -1, -1, -1) # expand()方法中的-1表示在该维度保持原始大小不变

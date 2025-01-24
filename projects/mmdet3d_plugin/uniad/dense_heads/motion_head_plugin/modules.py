@@ -112,8 +112,9 @@ class MotionTransformerDecoder(BaseModule): # 这个类是MotionFormer的解码�
             # fuse static and dynamic intention embedding
             # the dynamic intention embedding is the output of the previous layer, which is initialized with anchor embedding
             # dynamic_query_embed 是动态查询嵌入，表示在每一层中计算出的代理的当前意图。这些嵌入会随着网络的前向传播而更新，反映出代理在不同时间步长或上下文中的变化。
+            # /hat(x)^(l-1)_T
             dynamic_query_embed = self.dynamic_embed_fuser(torch.cat(
-                [agent_level_embedding, scene_level_offset_embedding, scene_level_ego_embedding], dim=-1))
+                [agent_level_embedding, scene_level_offset_embedding, scene_level_ego_embedding], dim=-1)) # 这几个embedding都是轨迹最后一个点，所以这个dynamic_query_embed应该就是/hat(x)^(l-1)_T
             
             # fuse static and dynamic intention embedding
             query_embed_intention = self.static_dynamic_fuser(torch.cat(
@@ -121,6 +122,7 @@ class MotionTransformerDecoder(BaseModule): # 这个类是MotionFormer的解码�
             
             # fuse intention embedding with query embedding
             # 这里的query_embed相当于Figure 4中的Q，其包括static和dynamic两个部分，然后也会考虑之前的query_embed
+            # 等式左边的query_embed是Q^(l-1)_{ctx}，也就是包含了上下文（几个interaction的输出，然后还一个track query方面的）
             query_embed = self.in_query_fuser(torch.cat([query_embed, query_embed_intention], dim=-1)) 
             
             # interaction between agents
@@ -185,9 +187,9 @@ class MotionTransformerDecoder(BaseModule): # 这个类是MotionFormer的解码�
                 # 经过agent_level_embedding_layer(MLP)后: [bs, n_agent, n_modes, 256]
                 
                 scene_level_ego_embedding = scene_level_ego_embedding_layer(pos2posemb2d(
-                    norm_points(ep_ego_embed[..., -1, :], self.pc_range)))
+                    norm_points(ep_ego_embed[..., -1, :], self.pc_range))) # 这里的-1指的是最后一个点
                 scene_level_offset_embedding = scene_level_offset_embedding_layer(pos2posemb2d(
-                    norm_points(ep_offset_embed[..., -1, :], self.pc_range)))
+                    norm_points(ep_offset_embed[..., -1, :], self.pc_range))) # 这里的-1指的是最后一个点    
 
                 # 保存每一层的预测结果，用于计算辅助损失
                 intermediate.append(query_embed)
